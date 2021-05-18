@@ -55,6 +55,10 @@ func Preview(sql string) int {
 		firstWord = trimmed[:end]
 	}
 	firstWord = strings.TrimLeftFunc(firstWord, func(r rune) bool { return !unicode.IsLetter(r) })
+	// select/*test*/
+	if start := trailingCommentStart(firstWord); start != 0 {
+		firstWord = firstWord[:start]
+	}
 	// Comparison is done in order of priority.
 	loweredFirstWord := strings.ToLower(firstWord)
 	switch loweredFirstWord {
