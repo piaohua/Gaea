@@ -314,6 +314,9 @@ func (r *Resultset) GetValue(row, column int) (interface{}, error) {
 
 // NameIndex return column index in Fields
 func (r *Resultset) NameIndex(name string) (int, error) {
+	if r.FieldNames == nil {
+		return 0, fmt.Errorf("invalid column name %s", name)
+	}
 	column, ok := r.FieldNames[name]
 	if ok {
 		return column, nil

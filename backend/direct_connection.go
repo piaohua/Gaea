@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	sqlerr "github.com/XiaoMi/Gaea/core/errors"
@@ -52,6 +53,8 @@ type DirectConnection struct {
 
 	pkgErr error
 	closed sync2.AtomicBool
+
+	version int
 }
 
 // NewDirectConnection return direct and authorised connection to mysql with real net connection
@@ -208,8 +211,11 @@ func (dc *DirectConnection) readInitialHandshake() error {
 	}
 
 	//skip mysql version
+	pos := bytes.IndexByte(data[1:], 0x00)
 	//mysql version end with 0x00
-	pos := 1 + bytes.IndexByte(data[1:], 0x00) + 1
+	version := string(data[1:pos])
+	_ = dc.serverVersion(version)
+	pos = 1 + pos + 1
 
 	// get connection id
 	dc.conn.ConnectionID = binary.LittleEndian.Uint32(data[pos : pos+4])
@@ -377,6 +383,28 @@ func (dc *DirectConnection) Ping() error {
 	return fmt.Errorf("unexpected packet type: %d", data[0])
 }
 
+// reset implements mysql reset command.
+// https://dev.mysql.com/doc/internals/en/com-reset-connection.html
+// https://dev.mysql.com/doc/c-api/5.7/en/mysql-reset-connection.html
+// https://dev.mysql.com/doc/relnotes/mysql/5.7/en/news-5-7-3.html
+func (dc *DirectConnection) reset() error {
+	dc.conn.SetSequence(0)
+	if err := dc.writePacket([]byte{mysql.ComResetConnection}); err != nil {
+		return err
+	}
+	data, err := dc.readPacket()
+	if err != nil {
+		return err
+	}
+	switch data[0] {
+	case mysql.OKHeader:
+		return nil
+	case mysql.ErrHeader:
+		return errors.New("dc connection ping failed")
+	}
+	return fmt.Errorf("unexpected packet type: %d", data[0])
+}
+
 // UseDB send ComInitDB to backend mysql
 func (dc *DirectConnection) UseDB(dbName string) error {
 	dc.conn.SetSequence(0)
@@ -477,10 +505,10 @@ func (dc *DirectConnection) SetCharset(charset string, collation mysql.Collation
 }
 
 // ResetConnection reset connection stattus, include transaction、autocommit、charset、sql_mode .etc
-func (dc *DirectConnection) ResetConnection() error {
+func (dc *DirectConnection) ResetConnection() (err error) {
 	if dc.IsInTransaction() {
 		log.Debug("get transaction connection from pool, addr: %s, user: %s, db: %s, status: %d", dc.addr, dc.user, dc.db, dc.status)
-		if err := dc.Rollback(); err != nil {
+		if err = dc.Rollback(); err != nil {
 			log.Warn("rollback in reset connection error, addr: %s, user: %s, db: %s, status: %d, err: %v", dc.addr, dc.user, dc.db, dc.status, err)
 			return err
 		}
@@ -488,11 +516,79 @@ func (dc *DirectConnection) ResetConnection() error {
 
 	if !dc.IsAutoCommit() {
 		log.Debug("get autocommit = 0 connection from pool, addr: %s, user: %s, db: %s, status: %d", dc.addr, dc.user, dc.db, dc.status)
-		if err := dc.SetAutoCommit(1); err != nil {
+		if err = dc.SetAutoCommit(1); err != nil {
 			log.Warn("set autocommit = 1 in reset connection error, addr: %s, user: %s, db: %s, status: %d, err: %v", dc.addr, dc.user, dc.db, dc.status, err)
 			return err
 		}
 	}
+
+	if dc.version >= 50703 { // 5.7.3+
+		if err = dc.reset(); err != nil {
+			log.Warn("ComResetConnection in reset connection error, addr: %s, user: %s, db: %s, status: %d, err: %v", dc.addr, dc.user, dc.db, dc.status, err)
+			return err
+		}
+	} else {
+		if err = dc.resetSession(); err != nil {
+			log.Warn("resetSession in reset connection error, addr: %s, user: %s, db: %s, status: %d, err: %v", dc.addr, dc.user, dc.db, dc.status, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// https://dev.mysql.com/doc/refman/5.6/en/server-system-variable-reference.html
+// https://dev.mysql.com/doc/refman/5.6/en/set-variable.html
+const (
+	sessionSets = `set
+	session autocommit=(select @@global.autocommit),
+	session sql_mode=(select @@global.sql_mode),
+	session sql_safe_updates=(select @@global.sql_safe_updates),
+	session time_zone=(select @@global.time_zone),
+	session character_set_results=(select @@global.character_set_results),
+	session character_set_client=(select @@global.character_set_client),
+	session character_set_connection=(select @@global.character_set_connection),
+	session tx_isolation=(select @@global.tx_isolation),
+	session tx_read_only=(select @@global.tx_read_only),
+	session sql_auto_is_null=(select @@global.sql_auto_is_null),
+	session last_insert_id=0
+	;`
+)
+
+// resetSession resets the session state
+func (dc *DirectConnection) resetSession() error {
+	_, err := dc.exec(sessionSets, 0)
+	return err
+}
+
+// serverVersion exec 'select version()' to backend mysql to get server version
+// https://dev.mysql.com/doc/c-api/5.6/en/mysql-get-server-version.html
+// https://dev.mysql.com/doc/refman/5.6/en/information-functions.html#function_version
+func (dc *DirectConnection) serverVersion(version string) error {
+	//r, err := dc.exec("select version()", 0)
+	//if err != nil {
+	//	return err
+	//}
+	//version, err := r.GetStringByName(0, "version()")
+	//if err != nil {
+	//	return err
+	//}
+
+	values := strings.Split(version, "-") // example: 5.7.3-log
+	if len(values) == 0 {
+		return nil
+	}
+	vs := strings.Split(values[0], ".")
+	if len(vs) < 3 {
+		return nil
+	}
+
+	var major, minor, patch int
+	major, _ = strconv.Atoi(vs[0])
+	minor, _ = strconv.Atoi(vs[1])
+	patch, _ = strconv.Atoi(vs[2])
+
+	dc.version = major*10000 + minor*100 + patch
 
 	return nil
 }
